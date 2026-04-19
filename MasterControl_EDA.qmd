@@ -1,0 +1,322 @@
+---
+title: "MasterControl EDA"
+format: html
+editor: visual
+---
+
+# Introduction
+
+MasterControl operates in a competitive B2B SaaS environment where sales performance depends heavily on effectively identifying and prioritizing high-quality leads. The dataset used in this analysis contains Qualified Account Leads (QALs) generated over a two-year period across MasterControl’s primary product families, Qx and Mx. While Qx has historically demonstrated stronger pipeline performance, Mx has underperformed relative to expectations. The objective of this exploratory analysis is to better understand the drivers of lead progression and identify structural differences between product families.
+
+The primary analytic objective is to model whether a QAL progresses to a meaningful downstream sales stage. Using the `next_stage_c` variable, leads that progressed to SQL, SQO, or Won are classified as successful progression, while other evaluated outcomes are classified as non-progression. Leads marked as “Exclude” or still under evaluation were removed from modeling consideration to avoid introducing operational noise.
+
+This exploratory data analysis seeks to answer the following key questions:
+
+-   What is the overall progression rate, and how does it differ between Qx and Mx?
+
+-   Are certain industries, manufacturing models, or territories associated with higher progression?
+
+-   Does contact seniority or functional alignment influence lead success?
+
+-   Are there data quality or structural issues that may impact modeling?
+
+-   What feature engineering opportunities exist to improve predictive modeling?
+
+Insights from this EDA will inform both model development and potential go-to-market refinements.
+
+# Description of the Data
+
+```{r}
+library(tidyverse)
+library(janitor)
+library(lubridate)
+library(skimr)
+library(naniar)
+library(scales)
+library(stringr)
+library(forcats)
+
+# Read raw file
+library(readr)
+df_raw <- read_csv("QAL Performance for MSBA.csv")
+
+# Clean column names
+df_raw <- df_raw |> clean_names()
+
+# Examine structure
+glimpse(df_raw)
+skim(df_raw)
+```
+
+The dataset contains 16,815 QAL (Qualified Account Lead) records across 14 variables. Each row corresponds to a unique qal_id, confirming that the modeling grain is one row per QAL. While there are 16,815 QAL records, there are only 15,517 unique contact/lead IDs, indicating that some contacts generated multiple QALs over time. This suggests repeated engagement and potential lead recycling behavior, which may be relevant in downstream modeling. All predictor variables are categorical (character) except for qal_cohort_date, which is properly formatted as a date. The categorical-heavy nature of the dataset suggests that feature engineering and interaction effects may play an important role in modeling performance.
+
+## Confirm the dataset matches the dictionary
+
+```{r}
+# Dataset dimensions
+dim(df_raw)
+
+# Row-level checks
+df_raw |> summarise(
+  n_rows = n(),
+  n_unique_qal_id = n_distinct(qal_id),
+  n_unique_contact = n_distinct(contact_lead_id)
+)
+```
+
+## Confirm Stage Distribution
+
+```{r}
+df_raw |> count(next_stage_c, sort = TRUE)
+```
+
+# Target Variable
+
+```{r}
+df <- df_raw |>
+  mutate(
+    progressed = case_when(
+      next_stage_c %in% c("SQL", "SQO", "Won") ~ 1L,
+      next_stage_c %in% c("Recycled", "Lost", "MQL", "INQ") ~ 0L,
+      next_stage_c %in% c("Exclude") ~ NA_integer_,
+      is.na(next_stage_c) ~ NA_integer_,
+      TRUE ~ NA_integer_
+    )
+  )
+
+df |> count(progressed)
+```
+
+Progressed = 1
+
+-   SQL
+
+-   SQO
+
+-   Won
+
+Not Progressed = 0
+
+-   Recycled
+
+-   Lost
+
+-   MQL
+
+-   INQ
+
+Remove from modeling
+
+-   Exclude
+
+-   NA
+
+Progressed: SQL (2718) SQO (254) Won (42) → 3,014 progressed
+
+Total usable (excluding Exclude + NA): 16,815 − 1,227 − 483 = 15,105
+
+So: 3,014 / 15,105 ≈ 19.9% progression rate
+
+This matches the \~18–20% expectation from the data dictionary
+
+The dataset contains 16,815 QAL records. After removing 1,227 "Exclude" records and 483 NULL stage records (still being evaluated), the modeling dataset contains 15,105 observations.\
+Approximately 20% of QALs progress to SQL, SQO, or Won status.\
+The class imbalance (80% non-progressed vs 20% progressed) suggests that evaluation metrics such as AUC and precision-recall may be more informative than accuracy.
+
+# Missing Data Analysis
+
+```{r}
+# Percent missing by variable
+missing_tbl <- df |>
+  summarise(across(everything(), ~mean(is.na(.)))) |>
+  pivot_longer(everything(), names_to = "field", values_to = "pct_missing") |>
+  arrange(desc(pct_missing))
+
+missing_tbl
+
+vis_miss(df, warn_large_data = FALSE)
+
+gg_miss_var(df) +
+  labs(title = "Missing values by variable",
+       x = NULL,
+       y = "Count missing")
+```
+
+Missingness in the dataset is relatively limited outside of next_stage_c, which includes records still under evaluation, and contact_lead_title, which contains a meaningful proportion of missing values. Missing title information may itself be informative. For example, incomplete or lower-quality lead records could correlate with lower progression rates. Rather than automatically dropping missing title values, we retain them and treat missingness as a potential predictive signal during feature engineering. Overall, the dataset does not exhibit widespread missing data issues that would materially compromise modeling feasibility.
+
+# Exploratory Analysis
+
+## Mx vs Qx Performance
+
+```{r}
+df |>
+  filter(!is.na(progressed)) |>
+  group_by(solution_rollup) |>
+  summarise(
+    n = n(),
+    progressed_rate = mean(progressed),
+    .groups = "drop"
+  )
+
+df |>
+  filter(!is.na(progressed)) |>
+  group_by(solution_rollup) |>
+  summarise(progressed_rate = mean(progressed), .groups = "drop") |>
+  ggplot(aes(x = solution_rollup, y = progressed_rate)) +
+  geom_col() +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(
+    title = "Progression Rate by Product Family",
+    x = "Product Family",
+    y = "Progressed Rate"
+  )
+```
+
+A primary business question is whether Mx underperforms relative to Qx. The progression rate comparison confirms a meaningful performance gap between the two product families. Qx demonstrates a materially higher progression rate than Mx. This gap suggests that differences in product-market fit, targeting, buyer alignment, or campaign strategy may be contributing to the performance disparity. Subsequent segment-level and title-level analyses explore potential drivers of this gap.
+
+## Segment-Level Performance
+
+```{r}
+progress_rate_by <- function(data, var, min_n = 100) {
+  data |>
+    filter(!is.na(progressed)) |>
+    group_by({{var}}) |>
+    summarise(
+      n = n(),
+      progressed_rate = mean(progressed),
+      .groups = "drop"
+    ) |>
+    filter(n >= min_n) |>
+    arrange(desc(progressed_rate))
+}
+
+progress_rate_by(df, acct_target_industry)
+progress_rate_by(df, acct_manufacturing_model)
+progress_rate_by(df, acct_primary_site_function)
+progress_rate_by(df, priority)
+progress_rate_by(df, last_tactic_campaign_channel)
+```
+
+Segment-level analysis reveals meaningful variation in progression rates across industries, manufacturing models, site functions, and campaign channels. Certain industries and manufacturing models demonstrate substantially higher conversion rates, suggesting that ICP (Ideal Customer Profile) alignment may differ across product families. These findings indicate that targeting strategy likely plays a significant role in overall performance. High-performing segments may represent opportunities for focused sales investment, while consistently low-performing segments may indicate misalignment or over-targeting.
+
+## Title Feature Engineering
+
+```{r}
+# Clean the title field
+df <- df |>
+  mutate(
+    title_raw = contact_lead_title,
+    title = str_to_lower(coalesce(title_raw, ""))  # handle NA safely
+  )
+
+# Create seniority buckets
+df <- df |>
+  mutate(
+    seniority = case_when(
+      str_detect(title, "\\bchief\\b|\\bceo\\b|\\bcfo\\b|\\bcoo\\b|\\bcio\\b|\\bcto\\b|\\bpresident\\b|\\bfounder\\b") ~ "C-Suite",
+      str_detect(title, "\\bvp\\b|\\bvice president\\b") ~ "VP",
+      str_detect(title, "\\bdirector\\b|\\bhead of\\b") ~ "Director",
+      str_detect(title, "\\bmanager\\b") ~ "Manager",
+      str_detect(title, "\\blead\\b|\\bsupervisor\\b") ~ "Lead/Supervisor",
+      str_detect(title, "\\bengineer\\b|\\bscientist\\b") ~ "Engineer/Scientist",
+      str_detect(title, "\\bspecialist\\b|\\banalyst\\b|\\bcoordinator\\b") ~ "Specialist/Analyst",
+      title == "" ~ "Missing Title",
+      TRUE ~ "Other"
+    )
+  )
+
+# Create functional signals
+df <- df |>
+  mutate(
+    has_quality       = str_detect(title, "quality|qa|qc|gxp|validation|qms"),
+    has_regulatory    = str_detect(title, "regulatory|ra|compliance"),
+    has_manufacturing = str_detect(title, "manufactur|production|plant|operations"),
+    has_it_systems    = str_detect(title, "it|information|systems|software|technology|data"),
+    has_engineering   = str_detect(title, "engineer|engineering|r&d|research|process")
+  )
+
+# Analyze seniority performance
+df |>
+  filter(!is.na(progressed)) |>
+  group_by(solution_rollup, seniority) |>
+  summarise(
+    n = n(),
+    progressed_rate = mean(progressed),
+    .groups = "drop"
+  ) |>
+  filter(n >= 50) |>
+  ggplot(aes(x = seniority, y = progressed_rate)) +
+  geom_col() +
+  coord_flip() +
+  facet_wrap(~solution_rollup) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(
+    title = "Progression Rate by Seniority (Mx vs Qx)",
+    x = "Seniority",
+    y = "Progressed Rate"
+  )
+
+# Analyze functional signals
+df |>
+  filter(!is.na(progressed)) |>
+  pivot_longer(
+    cols = c(has_quality, has_regulatory, has_manufacturing, 
+             has_it_systems, has_engineering),
+    names_to = "function_flag",
+    values_to = "has_flag"
+  ) |>
+  group_by(solution_rollup, function_flag, has_flag) |>
+  summarise(
+    n = n(),
+    progressed_rate = mean(progressed),
+    .groups = "drop"
+  ) |>
+  filter(has_flag == TRUE, n >= 100) |>
+  ggplot(aes(x = function_flag, y = progressed_rate)) +
+  geom_col() +
+  facet_wrap(~solution_rollup) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(
+    title = "Progression Rate by Functional Title Signal",
+    x = "Title Signal",
+    y = "Progressed Rate"
+  )
+```
+
+### [Seniority plot interpretation:]{.underline}
+
+Qx seems less sensitive to role level where even mid-level roles convert well.
+
+Mx is more hierarchy-sensitive where performance drops more steeply outside senior roles.
+
+That suggests Mx likely requires higher authority or strategic influence to progress.
+
+### [Functional Title Signals Interpretation:]{.underline}
+
+Mx underperforms Qx across every functional signal.
+
+Qx performs strongest with IT/Systems + Quality
+
+Mx performs best with Engineering (but still modestly)
+
+This suggests that Qx is resonating strongly with compliance and systems buyers. Mx may not yet have clear functional buyer alignment.
+
+# Results and Findings
+
+### Key Findings from Exploratory Analysis
+
+-   The dataset contains 16,815 QAL records with a clean one-row-per-QAL grain.
+
+-   After filtering operational exclusions and in-progress leads, approximately 15,105 observations remain for modeling.
+
+-   The overall progression rate is approximately 20%, indicating moderate class imbalance.
+
+-   Qx materially outperforms Mx in progression rate.
+
+-   Seniority and functional title signals appear strongly predictive of progression.
+
+-   Segment-level differences suggest variation in product-market fit across industries and manufacturing models.
+
+-   Title-based engineered features and product interactions are likely valuable modeling inputs.
+
+These findings suggest that a predictive model incorporating product family, segment attributes, and engineered title features may meaningfully improve sales prioritization and pipeline efficiency.

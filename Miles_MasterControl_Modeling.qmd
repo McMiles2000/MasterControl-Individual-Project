@@ -1,0 +1,337 @@
+---
+title: "Miles MasterControl Modeling"
+author: "Miles McCunniff"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-float: true
+    toc-title: "Table of Contents"
+    number-sections: true
+    number-depth: 2
+    embed-resources: true
+execute:
+  include: true
+  eval: true    
+  warning: false
+  message: false
+---
+
+# Introduction
+
+MasterControl operates in a competitive B2B software environment where efficient lead prioritization is critical to sales performance. The company generates a substantial volume of qualified account leads (QALs), but not all leads progress meaningfully through the pipeline. Because sales time and attention are limited, MasterControl needs a more data-driven way to identify which leads are most likely to advance. The objective of this modeling analysis is to develop a predictive model that can distinguish between QALs that are likely to reach an advanced sales stage and those that are not. While final closed-won outcomes are the most desirable result, the updated dataset contains relatively few won observations. To create a more stable and practically useful model, success is defined as progression to an advanced downstream stage, specifically SQL, SQO, or Won. The resulting model is intended to support lead prioritization and improve pipeline efficiency.
+
+## Business problem
+
+MasterControl wants to improve sales efficiency by understanding which QALs are most likely to progress successfully through the pipeline. The company is especially interested in improving decision-making around lead prioritization and follow-up so that sales resources are focused on the opportunities with the highest expected value.
+
+## Analytic problem
+
+Use historical QAL-level data to build a predictive model that classifies whether a lead is likely to reach a meaningful downstream sales stage. The model should outperform a benchmark, provide interpretable performance metrics, and generate insights that can support business prioritization.
+
+# Data Prep & Cleaning
+
+```{r}
+library(readr)
+library(tidyverse)
+library(caret)
+library(glmnet)
+library(randomForest)
+library(pROC)
+library(lubridate)
+
+data <- read_csv("Mastercontrol QAL Performance.csv")
+
+glimpse(data)
+summary(data)
+```
+
+```{r}
+# Remove rows with missing target stage first
+data <- data %>%
+  filter(!is.na(next_stage__c))
+
+# Create binary target variable
+data <- data %>%
+  mutate(
+    advanced_progression = ifelse(next_stage__c %in% c("SQL", "SQO", "Won"), 1, 0)
+  )
+
+# Check distribution
+table(data$advanced_progression)
+prop.table(table(data$advanced_progression))
+```
+
+The binary target variable advanced_progression indicates whether a QAL progressed to a downstream sales stage (SQL, SQO, or Won). This definition preserves a sufficient number of positive observations for modeling while still reflecting meaningful sales progress.
+
+```{r}
+# Handle missing categorical values
+data <- data %>%
+  mutate(across(where(is.character), ~replace_na(.x, "Unknown")))
+
+# Convert selected variables to factors
+data <- data %>%
+  mutate(
+    across(
+      c(
+        `acct primary site function`,
+        `acct manufacturing model`,
+        `acct target industry`,
+        `contact/lead title`,
+        Priority,
+        `acct territory rollup`,
+        `acct tier rollup`,
+        solution,
+        solution_rollup,
+        `last tactic campaign channel`
+      ),
+      as.factor
+    )
+  )
+```
+
+Several CRM fields represent categorical attributes such as industry, territory, product solution, and campaign channel. These variables are converted to factors so that they can be used appropriately in classification models.
+
+```{r}
+# Convert date variable
+data$`qal cohort date` <- as.Date(data$`qal cohort date`)
+
+data <- data %>%
+  mutate(
+    cohort_year = year(`qal cohort date`)
+  )
+```
+
+The QAL cohort date was converted to a date format and used to derive the year in which the lead entered the pipeline. This feature may capture time-based patterns in sales performance.
+
+```{r}
+# Replace remaining numeric missing values with median
+data <- data %>%
+  mutate(across(where(is.numeric), ~replace_na(.x, median(.x, na.rm = TRUE))))
+
+# Check that no missing values remain
+colSums(is.na(data))
+```
+
+```{r}
+# Remove ID fields
+data <- data %>%
+  select(
+    -`QAL ID`,
+    -`contact/lead id`,
+    -`next_stage__c`,
+    -`qal cohort date`
+  )
+```
+
+Unique identifiers such as QAL ID and contact ID were removed because they do not contain predictive information and could introduce noise into the model.
+
+## Train/Test Split
+
+```{r}
+set.seed(123)
+
+train_index <- createDataPartition(data$advanced_progression, p = 0.7, list = FALSE)
+
+train_data <- data[train_index, ]
+test_data <- data[-train_index, ]
+
+# Check class balance
+prop.table(table(train_data$advanced_progression))
+prop.table(table(test_data$advanced_progression))
+```
+
+The dataset was split into training (70%) and testing (30%) sets using stratified sampling to maintain the distribution of the target variable.
+
+# Benchmark Model
+
+```{r}
+# Cross validation setup
+set.seed(123)
+
+train_control <- trainControl(
+  method = "cv",
+  number = 10,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary
+)
+```
+
+10 folds splits training data into 10 groups Model trains on 9 folds and tests on 1 Repeats this process 10 times Produces a reliable estimate of out-of-sample performance
+
+```{r}
+# Caret requires factor labels
+train_data$advanced_progression <- factor(
+  train_data$advanced_progression,
+  levels = c(0,1),
+  labels = c("No","Yes")
+)
+
+test_data$advanced_progression <- factor(
+  test_data$advanced_progression,
+  levels = c(0,1),
+  labels = c("No","Yes")
+)
+```
+
+```{r}
+# Lump rare categories to reduce sparsity
+library(forcats)
+
+train_data$`acct target industry` <- fct_lump(train_data$`acct target industry`, n = 10)
+test_data$`acct target industry` <- fct_other(
+  test_data$`acct target industry`,
+  keep = levels(train_data$`acct target industry`)
+)
+
+train_data$`contact/lead title` <- fct_lump(train_data$`contact/lead title`, n = 15)
+test_data$`contact/lead title` <- fct_other(
+  test_data$`contact/lead title`,
+  keep = levels(train_data$`contact/lead title`)
+)
+
+train_data$`last tactic campaign channel` <- fct_lump(train_data$`last tactic campaign channel`, n = 10)
+test_data$`last tactic campaign channel` <- fct_other(
+  test_data$`last tactic campaign channel`,
+  keep = levels(train_data$`last tactic campaign channel`)
+)
+
+train_data$`acct territory rollup` <- fct_lump(train_data$`acct territory rollup`, n = 10)
+test_data$`acct territory rollup` <- fct_other(
+  test_data$`acct territory rollup`,
+  keep = levels(train_data$`acct territory rollup`)
+)
+```
+
+```{r}
+benchmark_model <- train(
+  advanced_progression ~ .,
+  data = train_data,
+  method = "glm",
+  family = "binomial",
+  trControl = train_control,
+  metric = "ROC",
+  preProcess = c("center", "scale")
+)
+
+# View results
+benchmark_model
+```
+
+```{r}
+# Evaluate on test set
+benchmark_pred <- predict(benchmark_model, test_data)
+
+# Confusion matrix
+confusionMatrix(benchmark_pred, test_data$advanced_progression)
+
+#ROC curve
+benchmark_probs <- predict(benchmark_model, test_data, type="prob")
+
+roc_curve <- roc(test_data$advanced_progression, benchmark_probs$Yes)
+
+auc(roc_curve)
+```
+
+## Interpretation
+
+The benchmark logistic regression model achieved a cross-validated ROC AUC of 0.83, indicating strong ability to distinguish between QALs that progress to advanced sales stages and those that do not. The model demonstrated high sensitivity (0.95), meaning it correctly identifies the vast majority of leads that ultimately progress. However, specificity is lower (0.36), suggesting the model struggles more to correctly classify leads that do not progress. This tradeoff is common in sales pipeline prediction tasks where the cost of missing a promising lead may be higher than incorrectly flagging a weaker lead as promising.
+
+# Modeling Process
+
+After establishing a benchmark logistic regression model, we explore additional machine learning methods to determine whether more flexible models improve predictive performance. Two models are evaluated: LASSO logistic regression and Random Forest. LASSO performs feature selection through regularization, while Random Forest captures nonlinear relationships and interactions between predictors.
+
+## Lasso
+
+```{r}
+lasso_model <- train(
+  advanced_progression ~ .,
+  data = train_data,
+  method = "glmnet",
+  trControl = train_control,
+  metric = "ROC",
+  preProcess = c("center", "scale"),
+  tuneLength = 10
+)
+
+lasso_model
+```
+
+```{r}
+# Evaluate Lasso on test data
+lasso_pred <- predict(lasso_model, test_data)
+
+confusionMatrix(lasso_pred, test_data$advanced_progression)
+
+# Compute AUC
+lasso_probs <- predict(lasso_model, test_data, type="prob")
+
+lasso_roc <- roc(test_data$advanced_progression, lasso_probs$Yes)
+
+auc(lasso_roc)
+```
+
+### Lasso Model Results
+
+The LASSO logistic regression model introduces regularization to reduce overfitting and perform automatic feature selection. The optimal model selected by cross-validation used alpha = 1 (pure LASSO) with lambda = 0.00157. When evaluated on the test dataset, the LASSO model achieved an ROC AUC of 0.833, slightly improving upon the benchmark logistic regression model (AUC = 0.825). Accuracy remained essentially unchanged at 0.844, while sensitivity increased slightly to 0.958. These results suggest that regularization improves the model’s ability to rank leads by likelihood of progression while maintaining similar overall classification performance.
+
+## Random Forest
+
+```{r}
+library(doParallel)
+
+cl <- makeCluster(parallel::detectCores() - 1)
+registerDoParallel(cl)
+
+rf_model <- train(
+  advanced_progression ~ .,
+  data = train_data,
+  method = "rf",
+  trControl = train_control,
+  metric = "ROC",
+  tuneLength = 3,
+  ntree = 300
+)
+
+# View results
+rf_model
+```
+
+```{r}
+# Evaluate Random Forest on test data
+rf_pred <- predict(rf_model, test_data)
+
+confusionMatrix(rf_pred, test_data$advanced_progression)
+
+# Compute AUC
+rf_probs <- predict(rf_model, test_data, type="prob")
+
+rf_roc <- roc(test_data$advanced_progression, rf_probs$Yes)
+
+auc(rf_roc)
+
+# Confusion matrix for Random Forest
+confusionMatrix(rf_pred, test_data$advanced_progression)
+```
+
+### Random Forest Results
+
+The Random Forest model was trained using 10-fold cross-validation to explore nonlinear relationships and interactions between predictors. The optimal model selected by cross-validation used mtry = 80, reflecting the large number of dummy variables created from categorical predictors. The Random Forest model achieved a cross-validated ROC AUC of 0.814, which is slightly lower than both the benchmark logistic regression model and the LASSO model. While Random Forest can capture complex nonlinear relationships, the results suggest that the predictive signal in this dataset is largely linear and well captured by regularized logistic regression.
+
+## Feature Importance
+
+```{r}
+varImp(rf_model)
+```
+
+# Model Performance
+
+| Model              | AUC       | Accuracy                |
+|--------------------|-----------|-------------------------|
+| Logistic Benchmark | 0.825     | 0.844                   |
+| LASSO              | **0.833** | **0.844**               |
+| Random Forest      | 0.814     | 0.837                   |
+
+Among the candidate models tested, the Lasso logistic regression model achieved the best predictive performance, improving ROC AUC from 0.825 to 0.833 relative to the benchmark model. Lasso also performs automatic feature selection and produces interpretable coefficients, which is why it was selected as the final model for further interpretation.
+
+# Results
