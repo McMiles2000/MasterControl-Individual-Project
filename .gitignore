@@ -1,0 +1,19 @@
+# R / Quarto
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+
+# Mac system files
+.DS_Store
+
+# Data files (prevent accidental uploads)
+*.csv
+*.xlsx
+*.rds
+*.Rds
+
+# Quarto intermediate files
+*_files/
+
+# Keep HTML outputs (so DO NOT ignore *.html)
